@@ -69,12 +69,19 @@
         },
         "maxResults": {
             "title": "Max Results Per Keyword",
-            "description": "Maximum tender records per keyword, up to 50. Start with 1 for a low-cost test.",
+            "description": "Maximum tender records per keyword, up to 50. Start with 1. Full PDF details can exceed a two-minute Run options timeout for larger searches. Increase the timeout or explicitly turn off PDF details for listing-only bulk results.",
             "type": "integer",
             "minimum": 1,
             "maximum": 50,
             "default": 1,
             "editor": "number"
+        },
+        "includePdfDetails": {
+            "title": "Include Bid PDF Details",
+            "description": "Enabled by default to preserve the existing enriched output. Turn off for faster bulk listing collection: PDF-only fields remain unknown, and detail filters/saved watchlists cannot be used. PDF downloads have a 35-second/8 MiB limit, bounded further by the selected run deadline. Evaluated reverse auctions may expose an unsupported HTML schedule index; unavailable or failed enrichment preserves the listing and marks coverage incomplete.",
+            "type": "boolean",
+            "default": true,
+            "editor": "checkbox"
         },
         "watchlistName": {
             "title": "Saved GeM Watchlist Name (Optional)",

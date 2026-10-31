@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createGemScanDiagnostics, gemListingEvidence, normalizeInput, scrapeTenders, validateGemSearchResponse, type GemScanRuntime, type GemSearchResponse } from './routes.js';
 import type { GemObservation, TenderRecord } from './types.js';
+import { SourceHttpError } from './http.js';
 
 test('saved watchlists are opt-in, validate names, and reject unsupported CPPP-only monitoring', () => {
     assert.equal(normalizeInput({ watchlistName: ' laptop-watch ' }).watchlistName, 'laptop-watch');
@@ -104,6 +105,14 @@ test('failed PDF enrichment can save a useful listing but makes monitoring incom
     assert.deepEqual(diagnostics.issues, [{ keyword: 'laptop', reason: 'pdf_failed' }]);
 });
 
+test('an unavailable schedule PDF preserves its listing without a false complete scan', async () => {
+    const { runtime } = mockRuntime({ async enrich(record) { return { record, evidence: gemListingEvidence(record), pdfStatus: 'unavailable' }; } });
+    const diagnostics = createGemScanDiagnostics();
+    assert.equal((await scrapeTenders({}, undefined, { diagnostics, gemRuntime: runtime })).length, 1);
+    assert.equal(diagnostics.complete, false);
+    assert.deepEqual(diagnostics.issues, [{ keyword: 'laptop', reason: 'pdf_unavailable' }]);
+});
+
 test('spending-limit callback stops before more pages, keywords, or PDF work and marks the saved final row partial', async () => {
     const { runtime, calls } = mockRuntime({ async fetchPage() { return page([doc(1), doc(2)], 2); } });
     const diagnostics = createGemScanDiagnostics();
@@ -147,4 +156,133 @@ test('invalid listing shape or bid identity cannot initialize a misleading basel
     const diagnostics = createGemScanDiagnostics();
     assert.deepEqual(await scrapeTenders({}, undefined, { diagnostics, gemRuntime: invalid.runtime }), []);
     assert.deepEqual(diagnostics.issues, [{ keyword: 'laptop', reason: 'invalid_record' }]);
+});
+
+test('listing-only collection is opt-in and incompatible detail options fail before any request', () => {
+    assert.equal(normalizeInput({}).includePdfDetails, true);
+    assert.equal(normalizeInput({ includePdfDetails: false }).includePdfDetails, false);
+    assert.equal(normalizeInput({ includePdfDetails: false, state: '  ', department: '  ' }).includePdfDetails, false);
+    for (const option of [{ watchlistName: 'watch' }, { state: 'Karnataka' }, { department: 'Education' }, { dateFrom: '2026-10-01' }, { dateTo: '2026-10-31' }, { minValue: 0 }, { maxValue: 10 }]) {
+        assert.throws(() => normalizeInput({ ...option, includePdfDetails: false }), /PDF details must be enabled/);
+    }
+    assert.throws(() => normalizeInput({ includePdfDetails: 'false' as never }), /must be true or false/);
+});
+
+for (const limit of [1, 40, 50]) test(`${limit} unique listing-only tenders use no PDF work and respect the result limit`, async () => {
+    const { runtime, calls } = mockRuntime({
+        async fetchPage(_session, _status, keyword, number) {
+            calls.push(`page:${keyword}:${number}`);
+            return page(Array.from({ length: 10 }, (_v, i) => doc((number - 1) * 10 + i + 1)), 100, (number - 1) * 10);
+        },
+    });
+    const diagnostics = createGemScanDiagnostics();
+    const observations: GemObservation[] = [];
+    const rows = await scrapeTenders({ includePdfDetails: false, maxResults: limit }, async (_record, observation) => {
+        observations.push(observation!); return true;
+    }, { diagnostics, gemRuntime: runtime });
+    assert.equal(rows.length, limit);
+    assert.equal(new Set(rows.map(row => row.tenderId)).size, limit);
+    assert.equal(calls.filter(call => call.startsWith('pdf:')).length, 0);
+    assert.equal(calls.filter(call => call.startsWith('page:')).length, Math.ceil(limit / 10));
+    assert.ok(observations.every(item => item.pdfStatus === 'skipped' && !item.evidence.publishedDate));
+    assert.equal(diagnostics.complete, true);
+});
+
+test('default 40-tender collection retains PDF enrichment for every unique saved bid', async () => {
+    const { runtime, calls } = mockRuntime({
+        async fetchPage(_session, _status, _keyword, number) {
+            return page(Array.from({ length: 10 }, (_v, i) => doc((number - 1) * 10 + i + 1)), 40, (number - 1) * 10);
+        },
+    });
+    const rows = await scrapeTenders({ maxResults: 40 }, undefined, { gemRuntime: runtime });
+    assert.equal(rows.length, 40);
+    assert.equal(calls.filter(call => call.startsWith('pdf:')).length, 40);
+});
+
+test('a 404 search rejection is not retried through another session or treated as an empty result', async () => {
+    let pages = 0;
+    const { runtime, calls } = mockRuntime({
+        async fetchPage() { pages += 1; throw new SourceHttpError(404, 'https://example.invalid/search'); },
+    });
+    const diagnostics = createGemScanDiagnostics();
+    await assert.rejects(scrapeTenders({}, undefined, { diagnostics, gemRuntime: runtime }), /HTTP 404/);
+    assert.equal(pages, 1);
+    assert.equal(calls.filter(call => call.startsWith('open:')).length, 1);
+    assert.equal(diagnostics.complete, false);
+    assert.equal(diagnostics.successfulPages, 0);
+});
+
+test('one rejected keyword preserves a separate successful keyword without a false complete scan', async () => {
+    const { runtime } = mockRuntime({
+        async fetchPage(_session, _status, keyword) {
+            if (keyword === 'unavailable') throw new SourceHttpError(404, 'https://example.invalid/search');
+            return page();
+        },
+    });
+    const diagnostics = createGemScanDiagnostics();
+    const rows = await scrapeTenders({ keywords: ['unavailable', 'synthetic'] }, undefined, { diagnostics, gemRuntime: runtime });
+    assert.equal(rows.length, 1);
+    assert.equal(diagnostics.complete, false);
+    assert.equal(diagnostics.keywords[0].coverage, 'incomplete');
+    assert.equal(diagnostics.keywords[1].coverage, 'result_limit');
+});
+
+test('deadline during enrichment preserves only already saved rows and stops all subsequent work', async () => {
+    const controller = new AbortController();
+    const { runtime, calls } = mockRuntime({
+        async fetchPage() { return page([doc(1), doc(2), doc(3), doc(4)], 40); },
+        async enrich(record) {
+            calls.push(`pdf:${record.tenderId}`);
+            if (record.tenderId.endsWith('/3')) { controller.abort(new Error('synthetic deadline')); throw controller.signal.reason; }
+            return { record, evidence: gemListingEvidence(record), pdfStatus: 'read' };
+        },
+    });
+    const diagnostics = createGemScanDiagnostics();
+    const rows = await scrapeTenders({ maxResults: 40, keywords: ['synthetic', 'unvisited'] }, undefined, { diagnostics, gemRuntime: runtime, signal: controller.signal });
+    assert.equal(rows.length, 2);
+    assert.equal(calls.filter(call => call.startsWith('pdf:')).length, 3);
+    assert.equal(calls.filter(call => call.startsWith('open:')).length, 1);
+    assert.equal(calls.filter(call => call === 'close').length, 1);
+    assert.equal(diagnostics.keywords.length, 1);
+    assert.deepEqual(diagnostics.issues, [{ keyword: 'synthetic', reason: 'time_limit' }]);
+    assert.equal(diagnostics.keywords[0].coverage, 'incomplete');
+});
+
+test('an expired deadline prevents session creation and a deadline in page fetching prevents session recovery', async () => {
+    const already = mockRuntime();
+    const initialDiagnostics = createGemScanDiagnostics();
+    assert.deepEqual(await scrapeTenders({}, undefined, { diagnostics: initialDiagnostics, gemRuntime: already.runtime, signal: AbortSignal.abort() }), []);
+    assert.deepEqual(already.calls, []);
+    assert.equal(initialDiagnostics.complete, false);
+
+    const controller = new AbortController();
+    const fetching = mockRuntime({ async fetchPage() { controller.abort(new Error('expired')); throw controller.signal.reason; } });
+    const diagnostics = createGemScanDiagnostics();
+    assert.deepEqual(await scrapeTenders({}, undefined, { diagnostics, gemRuntime: fetching.runtime, signal: controller.signal }), []);
+    assert.equal(fetching.calls.filter(call => call.startsWith('open:')).length, 1);
+    assert.equal(diagnostics.issues[0].reason, 'time_limit');
+});
+
+test('overlapping page identities do not consume the per-keyword result limit twice', async () => {
+    const { runtime, calls } = mockRuntime({
+        async fetchPage(_session, _status, _keyword, number) {
+            const first = number === 1 ? 1 : 6;
+            return page(Array.from({ length: 10 }, (_v, i) => doc(first + i)), 20, (number - 1) * 10);
+        },
+    });
+    const diagnostics = createGemScanDiagnostics();
+    const rows = await scrapeTenders({ maxResults: 15 }, undefined, { diagnostics, gemRuntime: runtime });
+    assert.equal(rows.length, 15);
+    assert.equal(calls.filter(call => call.startsWith('pdf:')).length, 15);
+    assert.equal(diagnostics.complete, true);
+});
+
+test('a repeated source page stops with explicit partial coverage and no duplicate result fee', async () => {
+    const { runtime, calls } = mockRuntime({ async fetchPage() { return page([doc(1), doc(2)], 40); } });
+    const diagnostics = createGemScanDiagnostics();
+    const rows = await scrapeTenders({ maxResults: 40 }, undefined, { diagnostics, gemRuntime: runtime });
+    assert.equal(rows.length, 2);
+    assert.equal(calls.filter(call => call.startsWith('pdf:')).length, 2);
+    assert.deepEqual(diagnostics.issues, [{ keyword: 'laptop', reason: 'repeated_page' }]);
+    assert.equal(diagnostics.complete, false);
 });

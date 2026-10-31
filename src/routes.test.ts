@@ -82,3 +82,16 @@ test('maps wrapped GeM listing values into a chargeable tender record', () => {
     assert.equal(record.tenderUrl, 'https://bidplus.gem.gov.in/showbidDocument/7605079');
     assert.equal(isChargeableTender(record), true);
 });
+
+for (const [type, evaluation, route] of [
+    [1, 0, 'showbidDocument'],
+    [2, 0, 'showradocumentPdf'],
+    [2, 1, 'list-ra-schedules'],
+    [2, 2, 'list-ra-schedules'],
+    [5, 0, 'showdirectradocumentPdf'],
+    [5, 1, 'showdirectradocumentPdf'],
+] as const) test(`official document route for bid type ${type}, evaluation ${evaluation}`, () => {
+    const record = mapGemDoc({ b_id: [91], b_bid_number: [`GEM/2099/${type === 1 ? 'B' : 'R'}/91`], bd_category_name: ['Synthetic fixture'], b_bid_type: [type], b_eval_type: [evaluation] }, 'fixture');
+    assert.equal(record.tenderUrl, `https://bidplus.gem.gov.in/${route}/91`);
+    assert.equal(record.tenderType, type === 1 ? 'bid' : 'reverse_auction');
+});

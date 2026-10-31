@@ -37,6 +37,29 @@ test('first safe bounded scan initializes silently and unchanged runs suppress d
     assert.deepEqual(second.summary.changes, []);
 });
 
+for (const route of ['showradocumentPdf', 'showdirectradocumentPdf', 'list-ra-schedules']) test(`correcting an old auction URL to ${route} does not invent a bid change`, () => {
+    const common = { tenderType: 'reverse_auction' };
+    const before = observation('GEM/2099/R/41', { ...common, tenderUrl: 'https://bidplus.gem.gov.in/showbidDocument/41' });
+    const first = compareWatchlist(null, scan([before]));
+    const after = observation('GEM/2099/R/41', { ...common, tenderUrl: `https://bidplus.gem.gov.in/${route}/41` });
+    const result = compareWatchlist(first.state, nextScan([after]));
+    assert.equal(result.commit, true);
+    assert.deepEqual(result.summary.changes, []);
+    assert.equal(result.state.scopes[0].bids[0].values.tenderUrl, after.record.tenderUrl);
+    after.record.closingDate = '2026-10-12T12:00:00Z';
+    const changed = compareWatchlist(first.state, nextScan([after]));
+    assert.deepEqual(changed.summary.changes[0].fields.map(item => item.field), ['closingDate']);
+});
+
+test('real document identity changes and ordinary bid URL changes are still reported', () => {
+    for (const tenderType of ['reverse_auction', 'bid']) {
+        const first = compareWatchlist(null, scan([observation('GEM/2099/R/41', { tenderType, tenderUrl: 'https://bidplus.gem.gov.in/showbidDocument/41' })]));
+        const after = observation('GEM/2099/R/41', { tenderType, tenderUrl: `https://bidplus.gem.gov.in/showradocumentPdf/${tenderType === 'bid' ? 41 : 42}` });
+        const result = compareWatchlist(first.state, nextScan([after]));
+        assert.deepEqual(result.summary.changes[0].fields.map(item => item.field), ['tenderUrl']);
+    }
+});
+
 test('newly observed and materially updated bids contain stable IDs and both source evidence values', () => {
     const first = compareWatchlist(null, scan());
     const secondScan = nextScan([
@@ -73,7 +96,7 @@ test('scope is normalized, includes search filters and result limit, and exclude
 
 test('partial or failed detail scans never commit, alert, or remove retained bids', () => {
     const first = compareWatchlist(null, scan());
-    for (const reason of ['search_failed', 'pdf_failed', 'page_limit', 'spending_limit', 'invalid_record'] as const) {
+    for (const reason of ['search_failed', 'pdf_failed', 'pdf_unavailable', 'page_limit', 'spending_limit', 'invalid_record', 'time_limit', 'repeated_page'] as const) {
         const partial = nextScan([observation('GEM/2026/B/2')]);
         partial.diagnostics.complete = false;
         partial.diagnostics.issues.push({ keyword: 'laptop', reason });

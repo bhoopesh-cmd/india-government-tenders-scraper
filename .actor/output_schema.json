@@ -10,6 +10,12 @@
       "description": "All clean tenders saved in this run, including unchanged bids when a watchlist is enabled. Dataset saving and tender-scraped charging still apply to every saved tender.",
       "template": "{{links.apiDefaultDatasetUrl}}/items"
     },
+    "runReport": {
+      "type": "string",
+      "title": "Collection coverage and stopping reason",
+      "description": "OUTPUT JSON records complete, partial, failed or spending-limited collection, saved tender count, listing/PDF mode and scan issues. A partial run does not prove the requested result window was collected.",
+      "template": "{{links.apiDefaultKeyValueStoreUrl}}/records/OUTPUT"
+    },
     "changes": {
       "type": "string",
       "title": "GeM watchlist change summary",

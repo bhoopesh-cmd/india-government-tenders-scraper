@@ -11,13 +11,13 @@
         "build": "tsc",
         "lint": "tsc --noEmit",
         "typecheck": "tsc --noEmit",
-        "test": "npm run build && node --test dist/billing.test.js dist/routes.test.js dist/scan.test.js dist/monitoring.test.js dist/monitoring-storage.test.js",
+        "test": "npm run build && node --test dist/*.test.js",
         "start": "node dist/main.js"
     },
     "dependencies": {
         "apify": "^3.7.2",
         "pdf-parse": "^1.1.1",
-        "undici": "~7.29.1"
+        "undici": "~7.30.1"
     },
     "devDependencies": {
         "@types/node": "^24.10.1",
@@ -25,11 +25,15 @@
         "typescript": "^5.9.3"
     },
     "engines": {
-        "node": ">=20.0.0"
+        "node": ">=24.22.1 <25"
     },
     "overrides": {
         "brace-expansion": "5.0.12",
         "adm-zip": "0.6.1",
-        "ip-address": "10.7.1"
+        "ip-address": "10.7.4",
+        "minimatch": "11.0.1",
+        "get-uri": {
+            "basic-ftp": "6.2.3"
+        }
     }
 }

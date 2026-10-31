@@ -1,20 +1,15 @@
 import { Actor, log } from 'apify';
-import { createRequire } from 'node:module';
-import type pdfParseType from 'pdf-parse';
 import { ProxyAgent } from 'undici';
 import { ActorInput, FieldEvidence, GemObservation, GemScanDiagnostics, NormalizedInput, TenderRecord, TenderStatus } from './types.js';
+import { canRetrySource, fetchBoundedResource, isPdfBody, waitForSourceDelay } from './http.js';
+import { parseGemPdfText } from './pdf.js';
 
 type JsonObject = Record<string, unknown>;
-
-const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse/lib/pdf-parse.js') as typeof pdfParseType;
 
 const GEM_BASE_URL = 'https://bidplus.gem.gov.in';
 const CPPP_ACTIVE_URL = 'https://eprocure.gov.in/eprocure/app?page=FrontEndLatestActiveTenders&service=page';
 const USER_AGENT =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36';
-const REQUEST_TIMEOUT_MS = 35000;
-const MAX_RETRIES = 3;
 const MAX_GEM_SESSION_ATTEMPTS = 4;
 const MAX_GEM_SESSION_REFRESHES = 2;
 const MAX_GEM_PAGES_PER_KEYWORD = 10;
@@ -29,6 +24,7 @@ export interface GemSession {
     csrfToken: string;
     cookie: string;
     dispatcher?: ProxyAgent;
+    signal?: AbortSignal;
 }
 
 export interface GemSearchResponse {
@@ -86,6 +82,13 @@ export function normalizeInput(input: ActorInput | null): NormalizedInput {
     if (dateFrom && dateTo && Date.parse(dateFrom) > Date.parse(dateTo)) {
         throw new Error('dateFrom cannot be after dateTo.');
     }
+    if (input?.includePdfDetails !== undefined && typeof input.includePdfDetails !== 'boolean') {
+        throw new Error('includePdfDetails must be true or false.');
+    }
+    const includePdfDetails = input?.includePdfDetails !== false;
+    if (!includePdfDetails && (watchlistName || cleanString(input?.department) || cleanString(input?.state) || dateFrom || dateTo || minValue !== null || maxValue !== null)) {
+        throw new Error('PDF details must be enabled for saved watchlists and detail filters. Remove those options or use includePdfDetails: true.');
+    }
 
     return {
         source,
@@ -98,6 +101,7 @@ export function normalizeInput(input: ActorInput | null): NormalizedInput {
         dateTo,
         status,
         maxResults: normalizeMaxResults(input?.maxResults),
+        includePdfDetails,
         watchlistName,
         proxyConfiguration: input?.proxyConfiguration,
     };
@@ -106,7 +110,7 @@ export function normalizeInput(input: ActorInput | null): NormalizedInput {
 export async function scrapeTenders(
     rawInput: ActorInput | null,
     onRecord?: TenderRecordHandler,
-    options: { diagnostics?: GemScanDiagnostics; gemRuntime?: GemScanRuntime } = {},
+    options: { diagnostics?: GemScanDiagnostics; gemRuntime?: GemScanRuntime; signal?: AbortSignal } = {},
 ): Promise<TenderRecord[]> {
     const input = normalizeInput(rawInput);
     const records: TenderRecord[] = [];
@@ -125,8 +129,8 @@ export async function scrapeTenders(
     if (input.source === 'gem' || input.source === 'both') {
         const diagnostics = options.diagnostics ?? createGemScanDiagnostics();
         const stopped = options.gemRuntime
-            ? await scanGemKeywords(input, consume, options.gemRuntime, diagnostics)
-            : await scrapeGem(input, consume, diagnostics);
+            ? await scanGemKeywords(input, consume, options.gemRuntime, diagnostics, options.signal)
+            : await scrapeGem(input, consume, diagnostics, options.signal);
         if (stopped) return records;
     }
 
@@ -143,26 +147,29 @@ export function isChargeableTender(record: TenderRecord): boolean {
     return Boolean(record.tenderId && record.tenderId !== 'unknown' && record.tenderTitle);
 }
 
-async function scrapeGem(input: NormalizedInput, consume: TenderRecordHandler, diagnostics: GemScanDiagnostics): Promise<boolean> {
+async function scrapeGem(input: NormalizedInput, consume: TenderRecordHandler, diagnostics: GemScanDiagnostics, signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
     const proxyConfiguration = await createGemProxyConfiguration();
 
     log.info('GeM network mode: Apify Residential Proxy, country=IN');
     const openFreshSession = async (reason: string): Promise<GemSession> => {
         let lastError: unknown;
         for (let attempt = 1; attempt <= MAX_GEM_SESSION_ATTEMPTS; attempt += 1) {
+            signal?.throwIfAborted();
             const sessionId = `gem${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}${attempt}`;
             try {
                 const proxyUrl = await proxyConfiguration.newUrl(sessionId);
                 if (!proxyUrl) throw new Error('Residential proxy URL was not created.');
-                return await createGemSession(proxyUrl);
+                return await createGemSession(proxyUrl, signal);
             } catch (error) {
+                if (signal?.aborted || !canRetrySource(error)) throw error;
                 lastError = error;
                 log.warning(
                     `GeM ${reason} session attempt ${attempt}/${MAX_GEM_SESSION_ATTEMPTS} failed: ${errorMessage(error)}`,
                 );
                 // Each attempt uses a new proxy session ID, so a blocked or dead exit IP is
                 // replaced on retry. Back off so GeM is not hit again immediately.
-                if (attempt < MAX_GEM_SESSION_ATTEMPTS) await randomDelay(2000 * attempt, 4000 * attempt);
+                if (attempt < MAX_GEM_SESSION_ATTEMPTS) await randomDelay(2000 * attempt, 4000 * attempt, signal);
             }
         }
         throw new Error(`GeM Residential India proxy session failed: ${errorMessage(lastError)}`);
@@ -173,8 +180,8 @@ async function scrapeGem(input: NormalizedInput, consume: TenderRecordHandler, d
         closeSession: closeGemSession,
         fetchPage: fetchGemPage,
         enrich: enrichGemRecord,
-        delay: randomDelay,
-    }, diagnostics);
+        delay: () => randomDelay(1000, 3000, signal),
+    }, diagnostics, signal);
 }
 
 export async function scanGemKeywords(
@@ -182,6 +189,7 @@ export async function scanGemKeywords(
     consume: TenderRecordHandler,
     runtime: GemScanRuntime,
     diagnostics: GemScanDiagnostics,
+    signal?: AbortSignal,
 ): Promise<boolean> {
     const issue = (keyword: string, reason: GemScanDiagnostics['issues'][number]['reason']) => {
         diagnostics.complete = false;
@@ -198,12 +206,20 @@ export async function scanGemKeywords(
         validateGemSearchResponse(data);
         return data;
     };
+    const deadlineReached = (keyword: string) => {
+        if (!signal?.aborted) return false;
+        issue(keyword, 'time_limit');
+        return true;
+    };
 
     try {
         for (const keyword of input.keywords) {
+            if (deadlineReached(keyword)) return true;
             let page = 1;
             let scrapedForKeyword = 0;
             let sessionRefreshes = 0;
+            const savedIds = new Set<string>();
+            const pageIds = new Set<string>();
             const coverage: GemScanDiagnostics['keywords'][number] = { keyword, coverage: 'incomplete', pages: 0 };
             diagnostics.keywords.push(coverage);
 
@@ -211,6 +227,7 @@ export async function scanGemKeywords(
                 try {
                     session = await runtime.openSession(`keyword-${keyword}-initial`);
                 } catch (error) {
+                    if (deadlineReached(keyword)) return true;
                     lastGemPageError = error;
                     log.warning(`Could not open a GeM India Residential session for keyword="${keyword}": ${errorMessage(error)}`);
                     issue(keyword, 'search_failed');
@@ -219,7 +236,9 @@ export async function scanGemKeywords(
             }
 
             while (scrapedForKeyword < input.maxResults) {
-                await runtime.delay();
+                if (deadlineReached(keyword)) return true;
+                try { await runtime.delay(); } catch (error) { if (deadlineReached(keyword)) return true; throw error; }
+                if (deadlineReached(keyword)) return true;
                 let pageSession = session;
                 if (!pageSession) break;
 
@@ -227,8 +246,9 @@ export async function scanGemKeywords(
                 try {
                     data = await readPage(pageSession, keyword, page);
                 } catch (error) {
+                    if (deadlineReached(keyword)) return true;
                     lastGemPageError = error;
-                    if (sessionRefreshes >= MAX_GEM_SESSION_REFRESHES) {
+                    if (!canRetrySource(error) || sessionRefreshes >= MAX_GEM_SESSION_REFRESHES) {
                         log.warning(
                             `Skipping the remaining GeM pages for keyword="${keyword}" after repeated page failures: ${errorMessage(error)}`,
                         );
@@ -246,6 +266,7 @@ export async function scanGemKeywords(
                         pageSession = session;
                         data = await readPage(pageSession, keyword, page);
                     } catch (refreshError) {
+                        if (deadlineReached(keyword)) return true;
                         lastGemPageError = refreshError;
                         log.warning(
                             `Skipping the remaining GeM pages for keyword="${keyword}" because its fresh session also failed: ${errorMessage(refreshError)}`,
@@ -266,20 +287,34 @@ export async function scanGemKeywords(
                     coverage.coverage = 'exhausted';
                     break;
                 }
+                const validIds = docs.map(doc => mapGemDoc(doc, keyword)).filter(isChargeableTender).map(record => record.tenderId);
+                if (validIds.length > 0 && validIds.every(id => pageIds.has(id))) {
+                    issue(keyword, 'repeated_page');
+                    break;
+                }
+                for (const id of validIds) pageIds.add(id);
 
                 for (const doc of docs) {
+                    if (deadlineReached(keyword)) return true;
                     if (scrapedForKeyword >= input.maxResults) break;
                     const mapped = mapGemDoc(doc, keyword);
                     if (!isChargeableTender(mapped)) {
                         issue(keyword, 'invalid_record');
                         continue;
                     }
+                    if (savedIds.has(mapped.tenderId)) continue;
                     const cached = observationsById.get(mapped.tenderId);
-                    const observation = cached
-                        ? { ...cached, record: { ...cached.record, keyword } }
-                        : await runtime.enrich(mapped, pageSession);
+                    let observation: GemObservation;
+                    try {
+                        observation = cached
+                            ? { ...cached, record: { ...cached.record, keyword } }
+                            : input.includePdfDetails
+                                ? await runtime.enrich(mapped, pageSession)
+                                : { record: mapped, evidence: gemListingEvidence(mapped), pdfStatus: 'skipped' };
+                    } catch (error) { if (deadlineReached(keyword)) return true; throw error; }
+                    if (deadlineReached(keyword)) return true;
                     if (observation.pdfStatus === 'read') observationsById.set(mapped.tenderId, observation);
-                    if (observation.pdfStatus !== 'read') issue(keyword, 'pdf_failed');
+                    if (input.includePdfDetails && observation.pdfStatus !== 'read') issue(keyword, observation.pdfStatus === 'unavailable' ? 'pdf_unavailable' : 'pdf_failed');
                     const record = observation.record;
                     if (!passesClientFilters(record, input)) continue;
                     if (!(await consume(record, observation))) {
@@ -287,6 +322,7 @@ export async function scanGemKeywords(
                         return true;
                     }
                     scrapedForKeyword += 1;
+                    savedIds.add(record.tenderId);
                 }
 
                 const start = data.response?.response?.start ?? (page - 1) * docs.length;
@@ -310,7 +346,7 @@ export async function scanGemKeywords(
         }
 
         if (successfulGemPages === 0 && lastGemPageError) {
-            throw new Error(`GeM did not return a readable search page after retries: ${errorMessage(lastGemPageError)}`);
+            throw new Error(`GeM did not return a readable search page: ${errorMessage(lastGemPageError)}`, { cause: lastGemPageError });
         }
     } finally {
         if (session) await runtime.closeSession(session);
@@ -344,9 +380,16 @@ async function createGemProxyConfiguration(): Promise<NonNullable<Awaited<Return
 async function enrichGemRecord(record: TenderRecord, session: GemSession): Promise<GemObservation> {
     const evidence = gemListingEvidence(record);
     if (!record.tenderUrl) return { record, evidence, pdfStatus: 'unavailable' };
+    // The official listing points evaluated RAs to an HTML schedule index.
+    // Preserve that canonical source link; never pretend the index is a PDF or
+    // substitute the parent bid's unrelated document as auction evidence.
+    if (new URL(record.tenderUrl).pathname.startsWith('/list-ra-schedules/')) {
+        log.info(`GeM ${record.tenderId} exposes a schedule index; PDF details are unavailable in this version.`);
+        return { record, evidence, pdfStatus: 'unavailable' };
+    }
 
     try {
-        await randomDelay(600, 1600);
+        await randomDelay(600, 1600, session.signal);
         const response = await fetchWithRetries(record.tenderUrl, {
             headers: {
                 ...baseGemHeaders(),
@@ -355,24 +398,26 @@ async function enrichGemRecord(record: TenderRecord, session: GemSession): Promi
                 ...(session.cookie ? { cookie: session.cookie } : {}),
             },
             dispatcher: session.dispatcher,
-        });
-        const bytes = Buffer.from(await response.arrayBuffer());
-        const result = await pdfParse(bytes);
-        return { record: mergeGemPdfDetails(record, result.text, evidence), evidence, pdfStatus: 'read' };
+        }, { signal: session.signal, timeoutMs: 35_000, attempts: 1, maxBytes: 8 * 1024 * 1024 });
+        const bytes = response.body;
+        if (!isPdfBody(bytes)) throw new Error('The public bid document is empty or is not a PDF.');
+        const text = await parseGemPdfText(bytes);
+        return { record: mergeGemPdfDetails(record, text, evidence), evidence, pdfStatus: 'read' };
     } catch (error) {
+        if (session.signal?.aborted) throw session.signal.reason;
         log.warning(`Could not enrich GeM PDF for ${record.tenderId}: ${errorMessage(error)}`);
         return { record, evidence, pdfStatus: 'failed' };
     }
 }
 
-async function createGemSession(proxyUrl: string | undefined): Promise<GemSession> {
+async function createGemSession(proxyUrl: string | undefined, signal?: AbortSignal): Promise<GemSession> {
     const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined;
     try {
         const response = await fetchWithRetries(`${GEM_BASE_URL}/all-bids`, {
             headers: baseGemHeaders(),
             dispatcher,
-        });
-        const text = await response.text();
+        }, { signal, maxBytes: 2 * 1024 * 1024 });
+        const text = response.body.toString('utf8');
         const csrfToken = extractCsrfToken(text);
         if (!csrfToken) {
             throw new Error('GeM CSRF token was not found on all-bids page.');
@@ -382,16 +427,18 @@ async function createGemSession(proxyUrl: string | undefined): Promise<GemSessio
             csrfToken,
             cookie: response.headers.getSetCookie?.().map((cookie) => cookie.split(';')[0]).join('; ') ?? '',
             dispatcher,
+            signal,
         };
     } catch (error) {
-        await dispatcher?.close();
+        await dispatcher?.destroy();
         throw error;
     }
 }
 
 async function closeGemSession(session: GemSession): Promise<void> {
     try {
-        await session.dispatcher?.close();
+        if (session.signal?.aborted) await session.dispatcher?.destroy();
+        else await session.dispatcher?.close();
     } catch (error) {
         log.warning(`Could not close the GeM proxy session cleanly: ${errorMessage(error)}`);
     }
@@ -425,9 +472,9 @@ async function fetchGemPage(session: GemSession, status: TenderStatus, keyword: 
         },
         body,
         dispatcher: session.dispatcher,
-    });
+    }, { signal: session.signal });
 
-    const text = await response.text();
+    const text = response.body.toString('utf8');
     if (text.trim().startsWith('<')) {
         throw new Error(`GeM returned HTML instead of JSON: ${text.slice(0, 160)}`);
     }
@@ -479,6 +526,10 @@ export function mapGemDoc(doc: JsonObject, keyword: string): TenderRecord {
     const ministry = firstString(doc, ['ba_official_details_minName']);
     const department = firstString(doc, ['ba_official_details_deptName']);
     const bidTypeCode = firstNumber(doc, ['b_bid_type']);
+    // Match the document routing used by GeM's public all-bids page.
+    const documentRoute = bidTypeCode === 5 ? 'showdirectradocumentPdf'
+        : bidTypeCode === 2 ? ((firstNumber(doc, ['b_eval_type']) ?? 0) > 0 ? 'list-ra-schedules' : 'showradocumentPdf')
+            : 'showbidDocument';
 
     return {
         source: 'gem',
@@ -505,7 +556,7 @@ export function mapGemDoc(doc: JsonObject, keyword: string): TenderRecord {
         eligibilityCriteriaSummary: null,
         emdAmount: null,
         tenderDocumentFee: null,
-        tenderUrl: bidId ? `${GEM_BASE_URL}/showbidDocument/${bidId}` : `${GEM_BASE_URL}/all-bids`,
+        tenderUrl: bidId ? `${GEM_BASE_URL}/${documentRoute}/${bidId}` : `${GEM_BASE_URL}/all-bids`,
         corrigendumCount: null,
         scrapedAt: new Date().toISOString(),
     };
@@ -596,7 +647,7 @@ async function scrapeCpppGuarded(input: NormalizedInput): Promise<TenderRecord[]
                 referer: 'https://eprocure.gov.in/eprocure/app',
             },
         });
-        html = await response.text();
+        html = response.body.toString('utf8');
     } catch (error) {
         // CPPP cannot return records in this version anyway, so an unreachable eprocure.gov.in
         // must never fail a run that already collected GeM tenders.
@@ -615,26 +666,8 @@ async function scrapeCpppGuarded(input: NormalizedInput): Promise<TenderRecord[]
     return [];
 }
 
-async function fetchWithRetries(url: string, init: FetchInitWithDispatcher = {}): Promise<Response> {
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-        try {
-            const response = await fetch(url, { ...init, signal: controller.signal } as RequestInit & { dispatcher?: ProxyAgent });
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status} from ${url}`);
-            }
-            return response;
-        } catch (error) {
-            lastError = error;
-            log.warning(`Fetch attempt ${attempt}/${MAX_RETRIES} failed for ${url}: ${errorMessage(error)}`);
-            if (attempt < MAX_RETRIES) await randomDelay(1000 * attempt, 3000 * attempt);
-        } finally {
-            clearTimeout(timeout);
-        }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+async function fetchWithRetries(url: string, init: FetchInitWithDispatcher = {}, options: Parameters<typeof fetchBoundedResource>[2] = {}) {
+    return fetchBoundedResource(url, init, options);
 }
 
 function baseGemHeaders(): Record<string, string> {
@@ -928,11 +961,9 @@ function isDateInRange(value: string | null, from: string | null, to: string | n
     return true;
 }
 
-async function randomDelay(min = 1000, max = 3000): Promise<void> {
+async function randomDelay(min = 1000, max = 3000, signal?: AbortSignal): Promise<void> {
     const ms = Math.floor(Math.random() * (max - min + 1)) + min;
-    await new Promise((resolve) => {
-        setTimeout(resolve, ms);
-    });
+    await waitForSourceDelay(ms, signal);
 }
 
 function errorMessage(error: unknown): string {

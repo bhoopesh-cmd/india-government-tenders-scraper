@@ -12,6 +12,8 @@ export interface ActorInput {
     dateTo?: string;
     status?: TenderStatus;
     maxResults?: number;
+    /** Keep true for PDF details. False returns only the public listing fields. */
+    includePdfDetails?: boolean;
     /** Enables persistent comparison when a saved watchlist name is provided. */
     watchlistName?: string;
     proxyConfiguration?: {
@@ -32,6 +34,7 @@ export interface NormalizedInput {
     dateTo: string | null;
     status: TenderStatus;
     maxResults: number;
+    includePdfDetails: boolean;
     watchlistName: string | null;
     proxyConfiguration?: ActorInput['proxyConfiguration'];
 }
@@ -75,12 +78,12 @@ export interface FieldEvidence {
 export interface GemObservation {
     record: TenderRecord;
     evidence: Partial<Record<keyof TenderRecord, FieldEvidence>>;
-    pdfStatus: 'read' | 'failed' | 'unavailable';
+    pdfStatus: 'read' | 'failed' | 'unavailable' | 'skipped';
 }
 
 export interface GemScanDiagnostics {
     complete: boolean;
     successfulPages: number;
-    issues: Array<{ keyword: string; reason: 'search_failed' | 'pdf_failed' | 'page_limit' | 'spending_limit' | 'invalid_record' }>;
+    issues: Array<{ keyword: string; reason: 'search_failed' | 'pdf_failed' | 'pdf_unavailable' | 'page_limit' | 'spending_limit' | 'invalid_record' | 'time_limit' | 'repeated_page' }>;
     keywords: Array<{ keyword: string; coverage: 'exhausted' | 'result_limit' | 'incomplete'; pages: number }>;
 }

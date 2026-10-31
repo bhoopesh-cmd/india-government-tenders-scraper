@@ -5,6 +5,8 @@ import { wasPushedRecordSaved } from './billing.js';
 import { finalizeWatchlist } from './monitoring.js';
 import { openWatchlistStorage } from './monitoring-storage.js';
 import { randomUUID } from 'node:crypto';
+import { createSourceBudget } from './run-budget.js';
+import { createRunReport } from './run-report.js';
 
 await Actor.init();
 
@@ -13,18 +15,21 @@ try {
     const normalizedInput = normalizeInput(input);
     const scanStartedAt = new Date().toISOString();
     const runId = Actor.getEnv().actorRunId ?? randomUUID();
+    const budget = createSourceBudget(Actor.getEnv().timeoutAt, normalizedInput.watchlistName ? 60_000 : 20_000);
     const diagnostics = createGemScanDiagnostics();
     const observations: GemObservation[] = [];
-    const watchlistStorage = normalizedInput.watchlistName ? await openWatchlistStorage(normalizedInput.watchlistName) : null;
+    let watchlistStorage: Awaited<ReturnType<typeof openWatchlistStorage>> | null = null;
 
     log.info(
-        `Starting tender scrape: source=${normalizedInput.source}, keywords=${normalizedInput.keywords.join(', ')}, maxResults=${normalizedInput.maxResults}`,
+        `Starting tender scrape: source=${normalizedInput.source}, keywords=${normalizedInput.keywords.join(', ')}, maxResults=${normalizedInput.maxResults}, PDF details=${normalizedInput.includePdfDetails}`,
     );
 
     let pushed = 0;
     let stoppedByChargeLimit = false;
+    let sourceError: unknown;
 
     try {
+        watchlistStorage = normalizedInput.watchlistName ? await openWatchlistStorage(normalizedInput.watchlistName) : null;
         await scrapeTenders(input, async (record, observation) => {
             if (!isChargeableTender(record)) return true;
 
@@ -40,15 +45,20 @@ try {
                 return false;
             }
             return true;
-        }, { diagnostics });
+        }, { diagnostics, signal: budget.signal });
     } catch (error) {
         diagnostics.complete = false;
-        if (watchlistStorage && normalizedInput.watchlistName) await finalizeWatchlist(watchlistStorage, {
-            watchlistName: normalizedInput.watchlistName, input: normalizedInput, observations, diagnostics,
-            runId, scanStartedAt, now: new Date().toISOString(),
-        });
-        throw error;
+        if (budget.signal.aborted && error === budget.signal.reason) {
+            const keyword = diagnostics.keywords.at(-1)?.keyword ?? normalizedInput.keywords[0];
+            if (!diagnostics.issues.some(item => item.keyword === keyword && item.reason === 'time_limit')) {
+                diagnostics.issues.push({ keyword, reason: 'time_limit' });
+            }
+        } else sourceError = error ?? new Error('Source collection failed without an error message.');
+    } finally {
+        budget.dispose();
     }
+    const report = createRunReport(normalizedInput, diagnostics, pushed, stoppedByChargeLimit, sourceError);
+    await Actor.setValue('OUTPUT', report);
     if (watchlistStorage && normalizedInput.watchlistName) {
         const summary = await finalizeWatchlist(watchlistStorage, {
             watchlistName: normalizedInput.watchlistName, input: normalizedInput, observations, diagnostics,
@@ -56,11 +66,17 @@ try {
         });
         log.info(`GeM watchlist ${summary.status}: ${summary.changes.length} changes; baseline committed=${summary.baselineCommitted}. Summary: GEM-CHANGES.`);
     }
+    if (sourceError !== undefined) throw sourceError;
+
+    if (!report.complete && !stoppedByChargeLimit) {
+        await Actor.setStatusMessage(`Incomplete scrape: ${pushed} tenders saved. See OUTPUT for coverage and the stopping reason.`);
+        log.warning(`Incomplete scrape: ${pushed} tender records preserved. No complete result window is claimed. See OUTPUT.`);
+    }
 
     if (pushed === 0 && !stoppedByChargeLimit) {
         log.warning('No clean tender records were pushed. No tender-scraped events were charged.');
     } else {
-        if (!stoppedByChargeLimit) {
+        if (!stoppedByChargeLimit && report.complete) {
             await Actor.setStatusMessage(`Finished with ${pushed} tender records`);
         }
         log.info(`Saved ${pushed} tender records${stoppedByChargeLimit ? ' before reaching the user spending limit' : ''}.`);

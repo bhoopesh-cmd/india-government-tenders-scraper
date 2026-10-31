@@ -4,11 +4,11 @@ Scrape public Indian government tender opportunities for procurement research, b
 
 PDF enrichment fills practical opportunity fields such as publishing date, bid opening date, bid validity, organization, ministry, department, state/location hints, EMD amount, and eligibility summary. Export to JSON, CSV, Excel, or HTML, or pull via the Apify API. No login and no API key are required for the public GeM flow.
 
-The default run is intentionally small: 1 `laptop` tender from GeM. The Actor accepts up to 5 keywords in one run, supports up to 50 matching tenders per keyword, and saves clean records to the Apify Dataset. Filters are applied after enrichment where the public source exposes the field, so state and published-date filters use recovered GeM detail data instead of rough listing text. A 10-page-per-keyword ceiling prevents restrictive filters from turning into unbounded scans.
+The default run is intentionally small: 1 `laptop` tender from GeM, with PDF details enabled. The Actor accepts up to 5 keywords in one run, supports up to 50 matching tenders per keyword, and saves clean records to the Apify Dataset. Filters are applied after enrichment where the public source exposes the field, so state and published-date filters use recovered GeM detail data instead of rough listing text. A 10-page-per-keyword ceiling prevents restrictive filters from turning into unbounded scans.
 
 An optional `watchlistName` saves a GeM baseline across Apify platform runs and produces a separate `GEM-CHANGES` report. Repeated scrapes still save and charge every clean tender, including unchanged bids; unchanged suppression applies only to the change report.
 
-GeM currently requires Residential India proxy routing for reliable public access. The Actor handles this internally, keeps the CSRF flow on one sticky session, and permits one capped fresh-session retry when GeM or a residential route becomes stale. Users do not need to configure proxies manually.
+GeM currently uses Residential India proxy routing. The Actor handles this internally and keeps the CSRF flow on one sticky session. Transient failures have bounded recovery; HTTP 401, 403, 404 and 429 are surfaced without repeated requests or a fresh-session retry. Users do not need to configure proxies manually. Source access is not guaranteed.
 
 CPPP extraction is not implemented in this version, even when a page has no CAPTCHA. Use `source: "gem"`. The legacy `cppp` and `both` inputs remain accepted for compatibility, but cannot produce CPPP records. No placeholder CPPP rows or `tender-scraped` events are generated for them; run-start and applicable platform usage charges can still apply.
 
@@ -49,8 +49,33 @@ CPPP extraction is not implemented in this version, even when a page has no CAPT
 | `dateFrom` / `dateTo` | string | Optional published-date range applied after GeM PDF enrichment |
 | `status` | string | `active`, `closed`, or `all`. Currently `all` uses the same ongoing GeM listing as `active`; it does not combine active and closed listings |
 | `maxResults` | number | Max matching records per keyword, up to 50. Default is 1 for a low-cost sample |
+| `includePdfDetails` | boolean | Default `true`. Set `false` for listing-only bulk results, without PDF requests. PDF-only fields remain unknown. Detail filters and saved watchlists require `true` |
 | `watchlistName` | string | Optional persistent GeM watchlist on the Apify platform. 1–50 letters, numbers, `_` or `-`, starting with a letter or number. Reuse the name for later comparisons |
 | Proxy routing | automatic | The Actor uses Residential India proxy routing internally because GeM blocks datacenter and non-India routes |
+
+## Bulk searches and run timeouts
+
+A two-minute run limit can stop a 40-tender PDF search before all details are downloaded. The timeout selected in **Run options** overrides the Actor's longer default; more memory does not resolve this network wait. Allow more time or reduce the result count for enriched searches. Completion time depends on GeM and the documents it serves.
+
+For a faster bulk search without PDF details, use:
+
+```json
+{
+  "source": "gem",
+  "keywords": ["laptop"],
+  "status": "active",
+  "maxResults": 40,
+  "includePdfDetails": false
+}
+```
+
+This collects real listing fields and bid document links. It does not invent PDF-only values. Remove detail filters and `watchlistName` for this mode. Prices still apply per saved tender; this is not a guarantee of 40 available matches or completion within a particular timeout.
+
+PDF downloads have a 35-second connection-and-body deadline, one attempt and an 8 MiB size limit, bounded further by the run's remaining source-work budget. Empty or non-PDF responses are rejected before parsing. Failed optional enrichment preserves the listing but makes the enriched scan incomplete. Search and listing downloads also have body-size and time limits.
+
+Bid and reverse-auction document links follow GeM's own listing routes. Evaluated reverse auctions can link to an HTML schedule index instead of a PDF. This version preserves that source link and reports `pdf_unavailable`; it does not fetch schedule attachments or substitute a parent bid PDF. Such an enriched scan is incomplete, and cannot update a saved watchlist. Listing-only mode still returns the canonical source link. Correcting an old, wrongly constructed auction link does not itself create a watchlist bid-change event.
+
+The Actor stops source work shortly before the selected platform timeout to leave time for reporting. This is a best-effort safeguard, not a guarantee against a platform kill or a stalled storage operation. Already saved Dataset rows remain available. Read `OUTPUT` in the run's key-value store: `status`, `complete`, `mode`, `savedTenders` and `scan.issues` distinguish a complete configured result window from partial, failed and spending-limited collection. An incomplete run is never described as a complete result window. Watchlist comparisons remain withheld for incomplete scans.
 
 ## Sample GeM Output
 
@@ -108,7 +133,7 @@ Later safe scans report `newly_observed_bid` and `updated_bid` events in `GEM-CH
 
 A corrigendum-count update requires an explicit `Corrigendum Count` or `Number of Corrigenda` count label. The ordinary listing/PDF often exposes no count, so `corrigendumCount` remains `null`. Deadline or status updates alone are not labeled corrigenda. This feature does not monitor a general corrigendum endpoint.
 
-Any search failure, PDF failure, page safety cap, spending stop, or invalid tender record makes the scan incomplete. The Actor preserves clean Dataset rows already saved, but withholds all change events and leaves the baseline unchanged. Review the report's `scan.issues`, fix the cause if needed, and run again.
+Any search failure, PDF failure, repeated page, time limit, page safety cap, spending stop, or invalid tender record makes the scan incomplete. The Actor preserves clean Dataset rows already saved, but withholds all change events and leaves the baseline unchanged. Review the report's `scan.issues`, fix the cause if needed, and run again.
 
 | Report status | Meaning |
 | --- | --- |

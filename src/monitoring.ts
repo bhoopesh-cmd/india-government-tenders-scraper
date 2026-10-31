@@ -18,6 +18,17 @@ export const MATERIAL_FIELDS = [
 type MaterialField = typeof MATERIAL_FIELDS[number];
 type MaterialValue = string | number;
 
+function isAuctionLinkCorrection(before: MaterialValue, after: MaterialValue, tenderType: MaterialValue | undefined): boolean {
+    if (tenderType !== 'reverse_auction' || typeof before !== 'string' || typeof after !== 'string') return false;
+    try {
+        const a = new URL(before), b = new URL(after);
+        if ([a, b].some(url => url.origin !== 'https://bidplus.gem.gov.in' || url.username || url.password || url.search || url.hash)) return false;
+        const oldId = a.pathname.match(/^\/showbidDocument\/(\d+)$/)?.[1];
+        const newId = b.pathname.match(/^\/(?:showradocumentPdf|showdirectradocumentPdf|list-ra-schedules)\/(\d+)$/)?.[1];
+        return oldId !== undefined && oldId === newId;
+    } catch { return false; }
+}
+
 export interface WatchlistScope {
     source: 'gem';
     keywords: string[];
@@ -244,6 +255,8 @@ export function compareWatchlist(rawState: unknown, scan: MonitorScan): { state:
             for (const field of MATERIAL_FIELDS) {
                 const before = previous.values[field];
                 const after = current.values[field];
+                if (field === 'tenderUrl' && before !== undefined && after !== undefined
+                    && isAuctionLinkCorrection(before, after, current.values.tenderType)) continue;
                 if (before !== undefined && after !== undefined && !equalValues(before, after)) fields.push({
                     field, previous: before, current: after,
                     previousEvidence: previous.evidence[field]!, evidence: current.evidence[field]!,
