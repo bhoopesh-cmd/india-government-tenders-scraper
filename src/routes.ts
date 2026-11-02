@@ -151,15 +151,19 @@ async function scrapeGem(input: NormalizedInput, consume: TenderRecordHandler, d
     signal?.throwIfAborted();
     const proxyConfiguration = await createGemProxyConfiguration();
 
-    log.info('GeM network mode: Apify Residential Proxy, country=IN');
+    if (proxyConfiguration) {
+        log.info('GeM network mode: Apify Residential Proxy, country=IN');
+    } else {
+        log.warning('GeM network mode: direct connection without proxy (local run without Apify Residential access).');
+    }
     const openFreshSession = async (reason: string): Promise<GemSession> => {
         let lastError: unknown;
         for (let attempt = 1; attempt <= MAX_GEM_SESSION_ATTEMPTS; attempt += 1) {
             signal?.throwIfAborted();
             const sessionId = `gem${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}${attempt}`;
             try {
-                const proxyUrl = await proxyConfiguration.newUrl(sessionId);
-                if (!proxyUrl) throw new Error('Residential proxy URL was not created.');
+                const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(sessionId) : undefined;
+                if (proxyConfiguration && !proxyUrl) throw new Error('Residential proxy URL was not created.');
                 return await createGemSession(proxyUrl, signal);
             } catch (error) {
                 if (signal?.aborted || !canRetrySource(error)) throw error;
@@ -355,10 +359,16 @@ export async function scanGemKeywords(
     return false;
 }
 
-async function createGemProxyConfiguration(): Promise<NonNullable<Awaited<ReturnType<typeof Actor.createProxyConfiguration>>>> {
+async function createGemProxyConfiguration(): Promise<NonNullable<Awaited<ReturnType<typeof Actor.createProxyConfiguration>>> | null> {
     // GeM (bidplus.gem.gov.in) refuses datacenter proxy exit IPs, so Residential India is the
     // only working route. Surface an actionable message instead of a raw SDK error when the
     // account running the Actor cannot use the Residential group.
+    if (!Actor.isAtHome() && !process.env.APIFY_TOKEN) {
+        // Local runs without Apify credentials would otherwise build a proxy URL with an empty
+        // password and every GeM request through it would fail. Connect directly instead.
+        log.warning('No Apify token detected (local run): skipping the Residential India proxy and connecting directly. GeM must accept this machine\'s exit IP.');
+        return null;
+    }
     try {
         const proxyConfiguration = await Actor.createProxyConfiguration({
             groups: ['RESIDENTIAL'],
