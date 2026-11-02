@@ -164,6 +164,7 @@ CPPP extraction is unavailable, not merely blocked by CAPTCHA: this version has 
 
 ## Notes
 
+- Award outcomes (`awardedTo`, `awardedPrice`, `bidResults`) are recovered from the public GeM bid result view when available; they are `null` when the result view is inaccessible or the tender has no published financial evaluation.
 - GeM tender value, tender document fee, and corrigendum count are left `null` when they are not exposed by the public listing or bid PDF. Corrigendum counts require an explicit count label.
 - Each GeM keyword gets an independent fresh-session recovery. If one keyword or later page remains unavailable, the Actor preserves clean tenders from other successful pages instead of failing the whole partial run. A run still fails when GeM never returns any readable search page.
 - GeM state/location is inferred from public bid PDF text when available. Records without a matched state are excluded only when a state filter is provided.

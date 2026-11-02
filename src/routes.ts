@@ -380,34 +380,66 @@ async function createGemProxyConfiguration(): Promise<NonNullable<Awaited<Return
 async function enrichGemRecord(record: TenderRecord, session: GemSession): Promise<GemObservation> {
     const evidence = gemListingEvidence(record);
     if (!record.tenderUrl) return { record, evidence, pdfStatus: 'unavailable' };
-    // The official listing points evaluated RAs to an HTML schedule index.
-    // Preserve that canonical source link; never pretend the index is a PDF or
-    // substitute the parent bid's unrelated document as auction evidence.
-    if (new URL(record.tenderUrl).pathname.startsWith('/list-ra-schedules/')) {
+    const isScheduleIndex = new URL(record.tenderUrl).pathname.startsWith('/list-ra-schedules/')
+        || new URL(record.tenderUrl).pathname.startsWith('/view-ra-schedules/');
+
+    let currentRecord = record;
+    let pdfStatus: GemObservation['pdfStatus'] = isScheduleIndex ? 'unavailable' : 'failed';
+
+    if (isScheduleIndex) {
         log.info(`GeM ${record.tenderId} exposes a schedule index; PDF details are unavailable in this version.`);
-        return { record, evidence, pdfStatus: 'unavailable' };
+    } else {
+        try {
+            await randomDelay(600, 1600, session.signal);
+            const response = await fetchWithRetries(record.tenderUrl, {
+                headers: {
+                    ...baseGemHeaders(),
+                    accept: 'application/pdf,*/*;q=0.8',
+                    referer: `${GEM_BASE_URL}/all-bids`,
+                    ...(session.cookie ? { cookie: session.cookie } : {}),
+                },
+                dispatcher: session.dispatcher,
+            }, { signal: session.signal, timeoutMs: 35_000, attempts: 1, maxBytes: 8 * 1024 * 1024 });
+            const bytes = response.body;
+            if (!isPdfBody(bytes)) throw new Error('The public bid document is empty or is not a PDF.');
+            const text = await parseGemPdfText(bytes);
+            currentRecord = mergeGemPdfDetails(currentRecord, text, evidence);
+            pdfStatus = 'read';
+        } catch (error) {
+            if (session.signal?.aborted) throw session.signal.reason;
+            log.warning(`Could not enrich GeM PDF for ${record.tenderId}: ${errorMessage(error)}`);
+            pdfStatus = 'failed';
+        }
     }
 
-    try {
-        await randomDelay(600, 1600, session.signal);
-        const response = await fetchWithRetries(record.tenderUrl, {
-            headers: {
-                ...baseGemHeaders(),
-                accept: 'application/pdf,*/*;q=0.8',
-                referer: `${GEM_BASE_URL}/all-bids`,
-                ...(session.cookie ? { cookie: session.cookie } : {}),
-            },
-            dispatcher: session.dispatcher,
-        }, { signal: session.signal, timeoutMs: 35_000, attempts: 1, maxBytes: 8 * 1024 * 1024 });
-        const bytes = response.body;
-        if (!isPdfBody(bytes)) throw new Error('The public bid document is empty or is not a PDF.');
-        const text = await parseGemPdfText(bytes);
-        return { record: mergeGemPdfDetails(record, text, evidence), evidence, pdfStatus: 'read' };
-    } catch (error) {
-        if (session.signal?.aborted) throw session.signal.reason;
-        log.warning(`Could not enrich GeM PDF for ${record.tenderId}: ${errorMessage(error)}`);
-        return { record, evidence, pdfStatus: 'failed' };
+    // Award outcomes (L1 winner + quoted price + ranked bidders) from the public result view.
+    const numericId = record.tenderUrl.match(/\/(\d+)\s*$/)?.[1];
+    if (numericId) {
+        try {
+            await randomDelay(400, 900, session.signal);
+            const resultUrl = `${GEM_BASE_URL}/bidding/bid/getBidResultView/${numericId}`;
+            const response = await fetchWithRetries(resultUrl, {
+                headers: {
+                    ...baseGemHeaders(),
+                    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    referer: `${GEM_BASE_URL}/all-bids`,
+                    ...(session.cookie ? { cookie: session.cookie } : {}),
+                },
+                dispatcher: session.dispatcher,
+            }, { signal: session.signal, timeoutMs: 35_000, attempts: 1, maxBytes: 4 * 1024 * 1024 });
+            const parsed = parseBidResultHtml(response.body.toString('utf8'));
+            if (parsed.awardedTo) {
+                currentRecord = { ...currentRecord, awardedTo: parsed.awardedTo, awardedPrice: parsed.awardedPrice, bidResults: parsed.bidResults };
+                evidence.awardedTo = { source: 'gem_bid_result', url: resultUrl };
+                if (parsed.awardedPrice !== null) evidence.awardedPrice = { source: 'gem_bid_result', url: resultUrl };
+            }
+        } catch (error) {
+            if (session.signal?.aborted) throw session.signal.reason;
+            log.warning(`Could not fetch GeM bid result for ${record.tenderId}: ${errorMessage(error)}`);
+        }
     }
+
+    return { record: currentRecord, evidence, pdfStatus };
 }
 
 async function createGemSession(proxyUrl: string | undefined, signal?: AbortSignal): Promise<GemSession> {
@@ -558,6 +590,9 @@ export function mapGemDoc(doc: JsonObject, keyword: string): TenderRecord {
         tenderDocumentFee: null,
         tenderUrl: bidId ? `${GEM_BASE_URL}/${documentRoute}/${bidId}` : `${GEM_BASE_URL}/all-bids`,
         corrigendumCount: null,
+        awardedTo: null,
+        awardedPrice: null,
+        bidResults: null,
         scrapedAt: new Date().toISOString(),
     };
 }
@@ -569,6 +604,45 @@ export function gemListingEvidence(record: TenderRecord): GemObservation['eviden
     const fields: Array<keyof TenderRecord> = ['tenderTitle', 'tenderReferenceNumber', 'department', 'ministry', 'category', 'tenderType', 'bidSubmissionStartDate', 'bidSubmissionEndDate', 'closingDate', 'tenderStatus', 'tenderUrl'];
     for (const field of fields) if (record[field] !== null) evidence[field] = { source: 'gem_listing', url: `${GEM_BASE_URL}/all-bids` };
     return evidence;
+}
+
+export function parseBidResultHtml(html: string): { awardedTo: string | null; awardedPrice: number | null; bidResults: Array<{ seller: string; offeredItem: string | null; totalPrice: number | null; rank: string | null }> | null } {
+    const marker = html.indexOf('List of Sellers Qualified Financially');
+    if (marker < 0) return { awardedTo: null, awardedPrice: null, bidResults: null };
+    const tableStart = html.indexOf('<table', marker);
+    const tableEnd = html.indexOf('</table>', tableStart);
+    if (tableStart < 0 || tableEnd < 0) return { awardedTo: null, awardedPrice: null, bidResults: null };
+    const table = html.slice(tableStart, tableEnd + 8);
+    const tbodyMatch = table.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+    const body = tbodyMatch ? tbodyMatch[1] : table;
+    const rowMatches = body.match(/<tr[^>]*>[\s\S]*?<\/tr>/gi) ?? [];
+    const results: Array<{ seller: string; offeredItem: string | null; totalPrice: number | null; rank: string | null }> = [];
+    for (const row of rowMatches) {
+        const cells = row.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) ?? [];
+        if (cells.length < 4) continue;
+        const strip = (value: string) => {
+            const decoded = value
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&amp;/gi, '&')
+                .replace(/&lt;/gi, '<')
+                .replace(/&gt;/gi, '>')
+                .replace(/&quot;/gi, '"')
+                .replace(/&#39;/g, "'");
+            return decoded.replace(/\s+/g, ' ').trim();
+        };
+        const seller = strip(cells[1]).replace(/\bUnder PMA\b/gi, '').trim();
+        const offeredItem = strip(cells[2]).replace(/^Item Categories\s*:\s*/i, '').trim() || null;
+        const priceText = strip(cells[3]);
+        const priceMatch = priceText.match(/[\d,]+(?:\.\d+)?/);
+        const totalPrice = priceMatch ? Number(priceMatch[0].replace(/,/g, '')) : null;
+        const rank = cells.length >= 5 ? (strip(cells[4]) || null) : null;
+        if (!seller) continue;
+        results.push({ seller, offeredItem, totalPrice, rank });
+    }
+    if (results.length === 0) return { awardedTo: null, awardedPrice: null, bidResults: null };
+    const l1 = results.find(item => item.rank === 'L1') ?? results[0];
+    return { awardedTo: l1.seller, awardedPrice: l1.totalPrice, bidResults: results };
 }
 
 export function mergeGemPdfDetails(record: TenderRecord, text: string, evidence?: GemObservation['evidence']): TenderRecord {

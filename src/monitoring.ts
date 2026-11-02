@@ -14,6 +14,7 @@ export const MATERIAL_FIELDS = [
     'tenderType', 'tenderValue', 'bidSubmissionStartDate', 'bidSubmissionEndDate', 'tenderOpenDate',
     'publishedDate', 'closingDate', 'bidValidity', 'tenderStatus', 'city', 'state', 'location',
     'eligibilityCriteriaSummary', 'emdAmount', 'tenderDocumentFee', 'tenderUrl', 'corrigendumCount',
+    'awardedTo', 'awardedPrice',
 ] as const satisfies ReadonlyArray<keyof TenderRecord>;
 type MaterialField = typeof MATERIAL_FIELDS[number];
 type MaterialValue = string | number;
@@ -151,7 +152,7 @@ function materialValue(field: MaterialField, value: unknown): MaterialValue | un
 function validEvidence(value: unknown): value is FieldEvidence {
     if (!value || typeof value !== 'object') return false;
     const evidence = value as FieldEvidence;
-    return (evidence.source === 'gem_listing' || evidence.source === 'gem_bid_pdf')
+    return (evidence.source === 'gem_listing' || evidence.source === 'gem_bid_pdf' || evidence.source === 'gem_bid_result')
         && typeof evidence.url === 'string' && /^https:\/\/bidplus\.gem\.gov\.in\//.test(evidence.url)
         && evidence.url.length <= 1000
         && (evidence.excerpt === undefined || (typeof evidence.excerpt === 'string' && evidence.excerpt.length <= 200));

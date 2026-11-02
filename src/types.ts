@@ -66,11 +66,14 @@ export interface TenderRecord {
     tenderDocumentFee: number | null;
     tenderUrl: string | null;
     corrigendumCount: number | null;
+    awardedTo: string | null;
+    awardedPrice: number | null;
+    bidResults: Array<{ seller: string; offeredItem: string | null; totalPrice: number | null; rank: string | null }> | null;
     scrapedAt: string;
 }
 
 export interface FieldEvidence {
-    source: 'gem_listing' | 'gem_bid_pdf';
+    source: 'gem_listing' | 'gem_bid_pdf' | 'gem_bid_result';
     url: string;
     excerpt?: string;
 }
