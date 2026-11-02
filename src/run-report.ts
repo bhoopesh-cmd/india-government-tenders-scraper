@@ -8,8 +8,9 @@ export function createRunReport(input: NormalizedInput, diagnostics: GemScanDiag
         if (cause instanceof SourceHttpError) { sourceHttpStatus = cause.status; break; }
         cause = cause.cause;
     }
+    const expectedCoverageEntries = input.keywords.length * (input.status === 'all' ? 2 : 1);
     const complete = error === undefined && input.source !== 'cppp' && diagnostics.complete
-        && diagnostics.keywords.length === input.keywords.length
+        && diagnostics.keywords.length === expectedCoverageEntries
         && diagnostics.keywords.every(item => item.coverage !== 'incomplete');
     const status = error !== undefined ? 'failed' : stoppedByChargeLimit ? 'spending_limit'
         : input.source === 'cppp' ? 'unsupported_source' : complete ? 'complete' : 'partial';

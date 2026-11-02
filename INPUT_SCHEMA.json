@@ -61,7 +61,7 @@
         },
         "status": {
             "title": "Tender Status",
-            "description": "Tender status filter. Current limitation: all uses the same ongoing GeM listing as active; it does not combine active and closed tenders.",
+            "description": "Tender status filter. active: ongoing bids; closed: awarded/closed bids; all: combines active and closed listings.",
             "type": "string",
             "enum": ["active", "closed", "all"],
             "default": "active",

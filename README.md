@@ -47,7 +47,7 @@ CPPP extraction is not implemented in this version, even when a page has no CAPT
 | `state` | string | Optional state filter from enriched GeM detail PDFs |
 | `minValue` / `maxValue` | number | Optional tender value range; unknown values are excluded when this filter is used |
 | `dateFrom` / `dateTo` | string | Optional published-date range applied after GeM PDF enrichment |
-| `status` | string | `active`, `closed`, or `all`. Currently `all` uses the same ongoing GeM listing as `active`; it does not combine active and closed listings |
+| `status` | string | `active`, `closed`, or `all`. `all` combines active and closed listings. |
 | `maxResults` | number | Max matching records per keyword, up to 50. Default is 1 for a low-cost sample |
 | `includePdfDetails` | boolean | Default `true`. Set `false` for listing-only bulk results, without PDF requests. PDF-only fields remain unknown. Detail filters and saved watchlists require `true` |
 | `watchlistName` | string | Optional persistent GeM watchlist on the Apify platform. 1–50 letters, numbers, `_` or `-`, starting with a letter or number. Reuse the name for later comparisons |

@@ -175,13 +175,41 @@ async function scrapeGem(input: NormalizedInput, consume: TenderRecordHandler, d
         throw new Error(`GeM Residential India proxy session failed: ${errorMessage(lastError)}`);
     };
 
-    return scanGemKeywords(input, consume, {
+    const runtime = {
         openSession: openFreshSession,
         closeSession: closeGemSession,
         fetchPage: fetchGemPage,
         enrich: enrichGemRecord,
         delay: () => randomDelay(1000, 3000, signal),
-    }, diagnostics, signal);
+    };
+
+    // "all" is not a single GeM listing filter: scan the active listing, then the closed/awarded
+    // listing, deduplicating tenders through the outer consume handler.
+    if (input.status === 'all') {
+        let stopped = false;
+        let anyFailed = false;
+        let lastError: unknown;
+        for (const status of ['active', 'closed'] as TenderStatus[]) {
+            if (signal?.aborted) { stopped = true; break; }
+            try {
+                if (await scanGemKeywords({ ...input, status }, consume, runtime, diagnostics, signal)) {
+                    stopped = true;
+                    break;
+                }
+            } catch (error) {
+                anyFailed = true;
+                lastError = error;
+                log.warning(`GeM ${status} scan failed; continuing with the other status: ${errorMessage(error)}`);
+            }
+        }
+        if (stopped) return true;
+        if (anyFailed && diagnostics.successfulPages === 0) {
+            throw lastError ?? new Error('GeM did not return a readable search page.');
+        }
+        return false;
+    }
+
+    return scanGemKeywords(input, consume, runtime, diagnostics, signal);
 }
 
 export async function scanGemKeywords(
